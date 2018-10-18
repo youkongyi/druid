@@ -813,6 +813,9 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
                 if (MockDriver.class.getName().equals(driverClass)) {
                     driver = MockDriver.instance;
                 } else {
+                    if (jdbcUrl == null && (driverClass == null || driverClass.length() == 0)) {
+                        throw new SQLException("url not set");
+                    }
                     driver = JdbcUtils.createDriver(driverClassLoader, driverClass);
                 }
             } else {
@@ -847,34 +850,34 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
 
             SQLException connectError = null;
 
-            if (createScheduler != null) {
+            if (createScheduler != null && asyncInit) {
                 for (int i = 0; i < initialSize; ++i) {
                     createTaskCount++;
                     CreateConnectionTask task = new CreateConnectionTask(true);
                     this.createSchedulerFuture = createScheduler.submit(task);
                 }
             } else if (!asyncInit) {
-                    // init connections
-                    while (poolingCount < initialSize) {
-                        try {
-                            PhysicalConnectionInfo pyConnectInfo = createPhysicalConnection();
-                            DruidConnectionHolder holder = new DruidConnectionHolder(this, pyConnectInfo);
-                            connections[poolingCount++] = holder;
-                        } catch (SQLException ex) {
-                            LOG.error("init datasource error, url: " + this.getUrl(), ex);
-                            if (initExceptionThrow) {
-                                connectError = ex;
-                                break;
-                            } else {
-                                Thread.sleep(3000);
-                            }
+                // init connections
+                while (poolingCount < initialSize) {
+                    try {
+                        PhysicalConnectionInfo pyConnectInfo = createPhysicalConnection();
+                        DruidConnectionHolder holder = new DruidConnectionHolder(this, pyConnectInfo);
+                        connections[poolingCount++] = holder;
+                    } catch (SQLException ex) {
+                        LOG.error("init datasource error, url: " + this.getUrl(), ex);
+                        if (initExceptionThrow) {
+                            connectError = ex;
+                            break;
+                        } else {
+                            Thread.sleep(3000);
                         }
                     }
+                }
 
-                    if (poolingCount > 0) {
-                        poolingPeak = poolingCount;
-                        poolingPeakTime = System.currentTimeMillis();
-                    }
+                if (poolingCount > 0) {
+                    poolingPeak = poolingCount;
+                    poolingPeakTime = System.currentTimeMillis();
+                }
             }
 
             createAndLogThread();
@@ -1373,6 +1376,7 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
 
         for (boolean createDirect = false;;) {
             if (createDirect) {
+                createStartNanosUpdater.set(this, System.nanoTime());
                 if (creatingCountUpdater.compareAndSet(this, 0, 1)) {
                     PhysicalConnectionInfo pyConnInfo = DruidDataSource.this.createPhysicalConnection();
                     holder = new DruidConnectionHolder(this, pyConnInfo);
@@ -1493,6 +1497,12 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
                .append(", maxActive ").append(maxActive)//
                .append(", creating ").append(creatingCount)//
             ;
+            if (creatingCount > 0 && createStartNanos > 0) {
+                long createElapseMillis = (System.nanoTime() - createStartNanos) / (1000 * 1000);
+                if (createElapseMillis > 0) {
+                    buf.append(", createElapseMillis ").append(createElapseMillis);
+                }
+            }
 
             List<JdbcSqlStatValue> sqlList = this.getDataSourceStat().getRuningSqlList();
             for (int i = 0; i < sqlList.size(); ++i) {
@@ -1671,6 +1681,11 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
                 return;
             }
 
+            if (phyMaxUseCount > 0 && holder.useCount >= phyMaxUseCount) {
+                discardConnection(holder.conn);
+                return;
+            }
+
             if (physicalConnection.isClosed()) {
                 lock.lock();
                 try {
@@ -1706,13 +1721,22 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
             }
 
             boolean result;
-            final long lastActiveTimeMillis = System.currentTimeMillis();
+            final long currentTimeMillis = System.currentTimeMillis();
+
+            if (phyTimeoutMillis > 0) {
+                long phyConnectTimeMillis = currentTimeMillis - holder.connectTimeMillis;
+                if (phyConnectTimeMillis > phyTimeoutMillis) {
+                    discardConnection(holder.conn);
+                    return;
+                }
+            }
+
             lock.lock();
             try {
                 activeCount--;
                 closeCount++;
 
-                result = putLast(holder, lastActiveTimeMillis);
+                result = putLast(holder, currentTimeMillis);
                 recycleCount++;
             } finally {
                 lock.unlock();
@@ -2824,7 +2848,11 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
                     holer.lastActiveTimeMillis = System.currentTimeMillis();
                     put(holer);
                 } else {
-                    JdbcUtils.close(connection);
+                    try {
+                        connection.close();
+                    } catch (Exception e) {
+                        // skip
+                    }
                 }
             }
             Arrays.fill(keepAliveConnections, null);
